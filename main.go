@@ -19,17 +19,23 @@ import (
 	"image"
 	"image/color"
 	"image/jpeg"
+	"log"
 	"math"
+	"net/http"
 	"os"
+	"os/exec"
+	"runtime"
+	"time"
 
 	"github.com/danhigham/gocv-blob/blob"
+	"github.com/hybridgroup/mjpeg"
 	uuid "github.com/satori/go.uuid"
 	"gocv.io/x/gocv"
+	"gocv.io/x/gocv/contrib"
 	"robpike.io/filter"
 )
 
 const minimumArea = 3000
-const pixelDistance = 115
 
 // const actualDistanceMilli = 14630
 const fov = 112
@@ -37,6 +43,51 @@ const fov = 112
 // const distance_to_road = 90.5 // distance to road in mm
 const distance_to_road = 49.5
 const image_width = 640.0
+
+type CamStream struct {
+	Stream  *mjpeg.Stream
+	Channel chan gocv.Mat
+}
+
+type CarRegister map[uuid.UUID]*Car
+
+type Car struct {
+	Track   []CarTrack
+	Tracker contrib.Tracker
+}
+
+type CarTrack struct {
+	TrackPoint blob.TrackPoint
+	Mat        *gocv.Mat
+}
+
+func (c *Car) MiddleMat() (*gocv.Mat, error) {
+	if len(c.Track) == 0 {
+		return nil, errors.New("Track length is zero!")
+	}
+
+	midPoint := c.Track[(len(c.Track) / 2)]
+	return midPoint.Mat, nil
+}
+
+func (c *Car) SpaceTimeTravelled() (float64, time.Duration, error) {
+
+	if len(c.Track) == 0 {
+		return 0, 0, errors.New("Track length is zero!")
+	}
+
+	lastPoint := c.Track[len(c.Track)-1].TrackPoint
+	firstPoint := c.Track[0].TrackPoint
+
+	distance := 0.0
+
+	for i := 0; i < len(c.Track)-2; i++ {
+		distance += distanceBetweenPoints(c.Track[i].TrackPoint.Point, c.Track[i+1].TrackPoint.Point)
+	}
+
+	timeTaken := lastPoint.Created.Sub(firstPoint.Created)
+	return distance, timeTaken, nil
+}
 
 type BackgroundMask struct {
 	mask []gocv.Mat
@@ -82,7 +133,7 @@ func getBoundingBoxes(contours [][]image.Point) []image.Rectangle {
 	return rects
 }
 
-func writeMatToFile(mat gocv.Mat, filename string) {
+func writeMatToFile(mat *gocv.Mat, filename string) {
 	target, err := mat.ToImage()
 	if err != nil {
 		panic(err)
@@ -145,6 +196,57 @@ func padRect(rect image.Rectangle, padAmount int) image.Rectangle {
 	return image.Rectangle{Min: min, Max: max}
 }
 
+func removeCar(register CarRegister, id uuid.UUID) {
+
+	car := register[id]
+
+	distance, duration, err := car.SpaceTimeTravelled()
+	mat, err := car.MiddleMat()
+
+	if err == nil {
+
+		frame_width := 2 * (math.Tan(degToRad(fov*0.5)) * distance_to_road)
+		ftperpixel := frame_width / image_width
+		ft := distance * ftperpixel
+		mph := (ft / duration.Seconds()) * 0.681818
+
+		fmt.Printf("%s Avg Speed: %3.2f mph across %3.2f ft\n", id.String(), mph, ft)
+		fmt.Printf("Removing %s\n", id.String())
+
+		writeMatToFile(mat, fmt.Sprintf("./cars/%s.jpg", id.String()))
+
+	}
+
+	delete(register, id)
+}
+
+func capture(camStream CamStream) {
+	for {
+		m := <-camStream.Channel
+		buf, _ := gocv.IMEncode(".jpg", m)
+		camStream.Stream.UpdateJPEG(buf)
+	}
+
+}
+
+func openbrowser(url string) {
+	var err error
+
+	switch runtime.GOOS {
+	case "linux":
+		err = exec.Command("xdg-open", url).Start()
+	case "windows":
+		err = exec.Command("rundll32", "url.dll,FileProtocolHandler", url).Start()
+	case "darwin":
+		err = exec.Command("open", url).Start()
+	default:
+		err = fmt.Errorf("unsupported platform")
+	}
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Println("How to run:\n\tmotion-detect [camera ID]")
@@ -157,12 +259,21 @@ func main() {
 		return
 	}
 
-	frame_width := 2 * (math.Tan(degToRad(fov*0.5)) * distance_to_road)
-	ftperpixel := frame_width / image_width
+	trackingStream := CamStream{Stream: mjpeg.NewStream(), Channel: make(chan gocv.Mat)}
+
+	go func() {
+		http.Handle("/stream", trackingStream.Stream)
+		log.Fatal(http.ListenAndServe("0.0.0.0:8080", nil))
+	}()
+	go capture(trackingStream)
+
+	openbrowser("http://localhost:8080/stream")
+
+	cars := make(CarRegister)
 
 	// create centroid tracker
 	// tracker := blob.NewCentroidTrackerDefaults()
-	tracker := blob.NewCentroidTracker(10, 40, 20)
+	tracker := blob.NewCentroidTracker(20, 40, 10)
 
 	// parse args
 	streamURL := os.Args[1]
@@ -173,14 +284,6 @@ func main() {
 		return
 	}
 	defer webcam.Close()
-
-	// windowHeight := 400
-
-	window := gocv.NewWindow("Motion Window")
-	defer window.Close()
-
-	// window2 := gocv.NewWindow("Blobs")
-	// defer window2.Close()
 
 	img := gocv.NewMat()
 	defer img.Close()
@@ -194,15 +297,9 @@ func main() {
 	mog2 := gocv.NewBackgroundSubtractorMOG2()
 	defer mog2.Close()
 
-	// if ok := webcam.Read(&img); !ok {
-	// 	fmt.Printf("Stream closed: %v\n", streamURL)
-	// 	return
-	// }
-	//
-	// writeMatToFile(img, "/tmp/background.jpg")
-
 	fmt.Printf("Start reading stream: %v\n", streamURL)
 	for {
+
 		if ok := webcam.Read(&img); !ok {
 			fmt.Printf("Stream closed: %v\n", streamURL)
 			return
@@ -232,43 +329,75 @@ func main() {
 
 		tracker.Update(bb)
 
-		if len(tracker.NewObjects) > 0 {
-			fmt.Printf("New: %+v\n", tracker.NewObjects)
-			fmt.Printf("Obj: %+v\n", tracker.Objects)
-		}
+		for _, id := range tracker.NewObjects {
 
-		for i, o := range tracker.Objects {
-			gocv.Rectangle(&img, o.CurrentRect, color.RGBA{0, 0, 255, 0}, 1)
-			last := o.GetLastPoint()
-			first := o.Track[0]
-			gocv.Line(&img, first.Point, last.Point, color.RGBA{0, 255, 0, 0}, 1)
-			statusColor := color.RGBA{0, 255, 0, 0}
-
-			distance, duration := o.SpaceTimeTravelled()
-
-			mph := ((distance * ftperpixel) / duration.Seconds()) * 0.681818
-
-			if len(tracker.NewObjects) > 0 {
-				if uuidin(i, tracker.NewObjects) {
-					fmt.Printf("CurrentRect: %+v\n", o.CurrentRect)
-					carFrame := img.Region(padRect(o.CurrentRect, 20))
-					carMat := carFrame.Clone()
-					defer carMat.Close()
-					defer carFrame.Close()
-
-					gocv.PutText(&carMat, fmt.Sprintf("%3.2f", mph), image.Pt(2, 2), gocv.FontHersheyPlain, 1, statusColor, 1)
-					writeMatToFile(carMat, fmt.Sprintf("./cars/%s.jpg", i.String()[0:7]))
-				}
+			cars[id] = &Car{
+				Track:   []CarTrack{},
+				Tracker: contrib.NewTrackerMOSSE(),
 			}
 
-			gocv.PutText(&img, fmt.Sprintf("%3.2f mph (%2.1f)", mph, duration.Seconds()), image.Pt(o.Center.X, o.Center.Y), gocv.FontHersheyPlain, 1.2, statusColor, 1)
+			defer cars[id].Tracker.Close()
+			cars[id].Tracker.Init(img, tracker.Objects[id].CurrentRect)
 		}
 
-		window.IMShow(img)
-		// window2.IMShow(imgThresh)
+		for i, _ := range tracker.Objects {
+			car := cars[i]
 
-		if window.WaitKey(1) == 27 {
-			break
+			if car == nil { //// TODO: Fix nil pointer dereference on missing tracker object
+				continue
+			}
+
+			rect, _ := car.Tracker.Update(img)
+
+			newPoint := image.Pt((rect.Min.X*2+rect.Dx())/2, (rect.Min.Y*2+rect.Dy())/2)
+
+			gocv.Rectangle(&img, rect, color.RGBA{255, 0, 0, 0}, 1)
+
+			for i := 0; i < len(car.Track)-2; i++ {
+				gocv.Line(&img, car.Track[i].TrackPoint.Point, car.Track[i+1].TrackPoint.Point, color.RGBA{255, 0, 0, 0}, 1)
+			}
+
+			frameClone := img.Clone()
+			frameClone = frameClone.Region(image.Rect(0, 0, 640, 190)) //Just show road in frame
+			defer frameClone.Close()
+
+			if newPoint.X > 0 && newPoint.Y > 0 {
+				cars[i].Track = append(car.Track, CarTrack{
+					TrackPoint: blob.NewTrackPoint(newPoint),
+					Mat:        &frameClone,
+				})
+			}
+
 		}
+
+		if len(tracker.Objects) == 0 && len(cars) > 0 {
+			for i, _ := range cars {
+				removeCar(cars, i)
+			}
+
+			cars = make(CarRegister)
+			continue
+		}
+
+		carIDs := make([]uuid.UUID, 0, len(cars))
+		for k := range cars {
+			carIDs = append(carIDs, k)
+		}
+
+		for _, i := range carIDs {
+			for o, _ := range tracker.Objects {
+				if o == i {
+					continue
+				}
+
+				removeCar(cars, i)
+			}
+		}
+
+		trackingStream.Channel <- img
+
+		// if window.WaitKey(1) == 27 {
+		// 	break
+		// }
 	}
 }
