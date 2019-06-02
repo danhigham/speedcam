@@ -14,6 +14,7 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"image"
@@ -27,6 +28,10 @@ import (
 	"runtime"
 	"time"
 
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/danhigham/gocv-blob/blob"
 	"github.com/hybridgroup/mjpeg"
 	uuid "github.com/satori/go.uuid"
@@ -71,6 +76,10 @@ func (c *Car) MiddleMat() (*gocv.Mat, error) {
 }
 
 func (c *Car) SpaceTimeTravelled() (float64, time.Duration, error) {
+
+	if c.Track == nil {
+		return 0, 0, errors.New("Track is null!")
+	}
 
 	if len(c.Track) == 0 {
 		return 0, 0, errors.New("Track length is zero!")
@@ -131,6 +140,20 @@ func getBoundingBoxes(contours [][]image.Point) []image.Rectangle {
 		rects = append(rects, gocv.BoundingRect(c))
 	}
 	return rects
+}
+
+func writeMatToBytes(mat *gocv.Mat) ([]byte, error) {
+	var buf []byte
+	target, err := mat.ToImage()
+	if err != nil {
+		return buf, err
+	}
+	b := bytes.NewBuffer(buf)
+	err = jpeg.Encode(b, target, nil)
+	if err != nil {
+		return buf, err
+	}
+	return buf, nil
 }
 
 func writeMatToFile(mat *gocv.Mat, filename string) {
@@ -208,13 +231,46 @@ func removeCar(register CarRegister, id uuid.UUID) {
 		frame_width := 2 * (math.Tan(degToRad(fov*0.5)) * distance_to_road)
 		ftperpixel := frame_width / image_width
 		ft := distance * ftperpixel
-		mph := (ft / duration.Seconds()) * 0.681818
 
-		fmt.Printf("%s Avg Speed: %3.2f mph across %3.2f ft\n", id.String(), mph, ft)
-		fmt.Printf("Removing %s\n", id.String())
+		if ft >= 60 { // need more than 60ft of distance for a good read
 
-		writeMatToFile(mat, fmt.Sprintf("./cars/%s.jpg", id.String()))
+			mph := (ft / duration.Seconds()) * 0.681818
 
+			fmt.Printf("%s Avg Speed: %3.2f mph across %3.2f ft\n", id.String(), mph, ft)
+			fmt.Printf("Removing %s\n", id.String())
+
+			s3Key := os.Getenv("S3_KEY")
+			s3Secret := os.Getenv("S3_SECRET")
+			s3Host := os.Getenv("S3_HOST")
+			s3Bucket := os.Getenv("S3_BUCKET")
+
+			s3Config := &aws.Config{
+				Credentials:      credentials.NewStaticCredentials(s3Key, s3Secret, ""),
+				Endpoint:         aws.String(s3Host),
+				Region:           aws.String("us-east-1"),
+				DisableSSL:       aws.Bool(false),
+				S3ForcePathStyle: aws.Bool(true),
+			}
+			session := session.New(s3Config)
+			s3Client := s3.New(session)
+
+			clone := mat.Clone()
+			defer clone.Close()
+			matBytes, err := gocv.IMEncode(".jpg", clone)
+
+			key := aws.String(fmt.Sprintf("%s.jpg", id.String()))
+
+			_, err = s3Client.PutObject(&s3.PutObjectInput{
+				Body:   bytes.NewReader(matBytes),
+				Bucket: aws.String(s3Bucket),
+				Key:    key,
+			})
+			if err != nil {
+				fmt.Printf("Failed to upload data to %s/%s, %s\n", s3Bucket, *key, err.Error())
+			}
+
+			// writeMatToFile(mat, fmt.Sprintf("./cars/%s.jpg", id.String()))
+		}
 	}
 
 	delete(register, id)
@@ -248,10 +304,9 @@ func openbrowser(url string) {
 }
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Println("How to run:\n\tmotion-detect [camera ID]")
-		return
-	}
+
+	// get env vars
+	streamURL := os.Getenv("STREAM_URL")
 
 	bm, err := NewBackgroundMask("./background_mask.jpg")
 	if err != nil {
@@ -274,9 +329,6 @@ func main() {
 	// create centroid tracker
 	// tracker := blob.NewCentroidTrackerDefaults()
 	tracker := blob.NewCentroidTracker(20, 40, 10)
-
-	// parse args
-	streamURL := os.Args[1]
 
 	webcam, err := gocv.VideoCaptureFile(streamURL)
 	if err != nil {
