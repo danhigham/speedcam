@@ -15,7 +15,9 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"image"
 	"image/color"
@@ -35,6 +37,7 @@ import (
 	"github.com/danhigham/gocv-blob/blob"
 	"github.com/hybridgroup/mjpeg"
 	uuid "github.com/satori/go.uuid"
+	"github.com/streadway/amqp"
 	"gocv.io/x/gocv"
 	"gocv.io/x/gocv/contrib"
 	"robpike.io/filter"
@@ -64,6 +67,19 @@ type Car struct {
 type CarTrack struct {
 	TrackPoint blob.TrackPoint
 	Mat        *gocv.Mat
+}
+
+type CarMessage struct {
+	ImageURI  string
+	Speed     float64
+	Distance  float64
+	TimeStamp time.Time
+}
+
+func failOnError(err error, msg string) {
+	if err != nil {
+		log.Fatalf("%s: %s", msg, err)
+	}
 }
 
 func (c *Car) MiddleMat() (*gocv.Mat, error) {
@@ -219,7 +235,7 @@ func padRect(rect image.Rectangle, padAmount int) image.Rectangle {
 	return image.Rectangle{Min: min, Max: max}
 }
 
-func removeCar(register CarRegister, id uuid.UUID) {
+func removeCar(carMessageChan chan CarMessage, register CarRegister, id uuid.UUID) {
 
 	car := register[id]
 
@@ -269,6 +285,15 @@ func removeCar(register CarRegister, id uuid.UUID) {
 				fmt.Printf("Failed to upload data to %s/%s, %s\n", s3Bucket, *key, err.Error())
 			}
 
+			msg := CarMessage{
+				ImageURI:  *key,
+				Speed:     mph,
+				Distance:  ft,
+				TimeStamp: time.Now(),
+			}
+
+			carMessageChan <- msg
+
 			// writeMatToFile(mat, fmt.Sprintf("./cars/%s.jpg", id.String()))
 		}
 	}
@@ -303,7 +328,11 @@ func openbrowser(url string) {
 	}
 }
 
+var showWindowsFlag bool
+
 func main() {
+	flag.BoolVar(&showWindowsFlag, "show-windows", false, "Show windows for output preview")
+	flag.Parse()
 
 	// get env vars
 	streamURL := os.Getenv("STREAM_URL")
@@ -313,6 +342,53 @@ func main() {
 		fmt.Printf("Error opening background mask - %s", err)
 		return
 	}
+
+	// start thread listening for car messages
+	carMessageChan := make(chan CarMessage)
+
+	go func() {
+		rabbitURL := fmt.Sprintf("amqp://%s:%s@%s:5672/", os.Getenv("RABBIT_USER"), os.Getenv("RABBIT_PASS"), os.Getenv("RABBIT_HOST"))
+		fmt.Printf("Connecting to AMPQ at %s\n", rabbitURL)
+
+		conn, err := amqp.Dial(rabbitURL)
+		failOnError(err, "Failed to connect to RabbitMQ")
+		defer conn.Close()
+
+		ch, err := conn.Channel()
+		failOnError(err, "Failed to open a channel")
+		defer ch.Close()
+
+		q, err := ch.QueueDeclare(
+			"cars", // name
+			false,  // durable
+			false,  // delete when unused
+			false,  // exclusive
+			false,  // no-wait
+			nil,    // arguments
+		)
+
+		failOnError(err, "Failed to declare a queue")
+
+		for {
+			carMessage := <-carMessageChan
+
+			jsonMsg, err := json.Marshal(carMessage)
+			failOnError(err, "Failed to marshal json message")
+
+			fmt.Printf("Publishing message %s\n", string(jsonMsg))
+
+			err = ch.Publish(
+				"",     // exchange
+				q.Name, // routing key
+				false,  // mandatory
+				false,  // immediate
+				amqp.Publishing{
+					ContentType: "application/json",
+					Body:        jsonMsg,
+				})
+		}
+
+	}()
 
 	trackingStream := CamStream{Stream: mjpeg.NewStream(), Channel: make(chan gocv.Mat)}
 
@@ -336,6 +412,18 @@ func main() {
 		return
 	}
 	defer webcam.Close()
+
+	var feedWindow *gocv.Window
+	var blobWindow *gocv.Window
+
+	if showWindowsFlag {
+		fmt.Println(showWindowsFlag)
+		feedWindow = gocv.NewWindow("Video Feed")
+		defer feedWindow.Close()
+
+		blobWindow = gocv.NewWindow("Blobs")
+		defer blobWindow.Close()
+	}
 
 	img := gocv.NewMat()
 	defer img.Close()
@@ -424,7 +512,7 @@ func main() {
 
 		if len(tracker.Objects) == 0 && len(cars) > 0 {
 			for i, _ := range cars {
-				removeCar(cars, i)
+				removeCar(carMessageChan, cars, i)
 			}
 
 			cars = make(CarRegister)
@@ -442,11 +530,20 @@ func main() {
 					continue
 				}
 
-				removeCar(cars, i)
+				removeCar(carMessageChan, cars, i)
 			}
 		}
 
-		trackingStream.Channel <- img
+		streamClone := img.Clone()
+		streamClone = streamClone.Region(image.Rect(0, 0, 640, 190)) //Just show road in frame
+		defer streamClone.Close()
+
+		trackingStream.Channel <- streamClone
+
+		if showWindowsFlag {
+			feedWindow.IMShow(img)
+			blobWindow.IMShow(imgThresh)
+		}
 
 		// if window.WaitKey(1) == 27 {
 		// 	break
