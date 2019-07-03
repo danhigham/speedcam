@@ -398,7 +398,7 @@ func main() {
 	}()
 	go capture(trackingStream)
 
-	openbrowser("http://localhost:8080/stream")
+  //openbrowser("http://localhost:8080/stream")
 
 	cars := make(CarRegister)
 
