@@ -40,7 +40,6 @@ import (
 	"github.com/streadway/amqp"
 	"gocv.io/x/gocv"
 	"gocv.io/x/gocv/contrib"
-	"robpike.io/filter"
 )
 
 const minimumArea = 3000
@@ -61,7 +60,7 @@ type CarRegister map[uuid.UUID]*Car
 
 type Car struct {
 	Track   []CarTrack
-	Tracker contrib.Tracker
+	Tracker gocv.Tracker
 }
 
 type CarTrack struct {
@@ -135,7 +134,8 @@ func NewBackgroundMask(filename string) (*BackgroundMask, error) {
 }
 
 func (bm BackgroundMask) isInsideMask(c []image.Point) bool {
-	rect := gocv.BoundingRect(c)
+
+	rect := gocv.BoundingRect(gocv.NewPointVectorFromPoints(c))
 	center := image.Pt((rect.Min.X*2+rect.Dx())/2, (rect.Min.Y*2+rect.Dy())/2)
 
 	maskR := bm.mask[0].GetUCharAt(center.Y, center.X)
@@ -146,14 +146,14 @@ func (bm BackgroundMask) isInsideMask(c []image.Point) bool {
 }
 
 func isTrackable(c []image.Point) bool {
-	area := gocv.ContourArea(c)
+	area := gocv.ContourArea(gocv.NewPointVectorFromPoints(c))
 	return !(area < minimumArea)
 }
 
 func getBoundingBoxes(contours [][]image.Point) []image.Rectangle {
 	var rects []image.Rectangle
 	for _, c := range contours {
-		rects = append(rects, gocv.BoundingRect(c))
+		rects = append(rects, gocv.BoundingRect(gocv.NewPointVectorFromPoints(c)))
 	}
 	return rects
 }
@@ -347,7 +347,7 @@ func main() {
 	carMessageChan := make(chan CarMessage)
 
 	go func() {
-		rabbitURL := fmt.Sprintf("amqp://%s:%s@%s:5672/", os.Getenv("RABBIT_USER"), os.Getenv("RABBIT_PASS"), os.Getenv("RABBIT_HOST"))
+		rabbitURL := fmt.Sprintf("amqp://%s:%s@%s:%s/", os.Getenv("RABBIT_USER"), os.Getenv("RABBIT_PASS"), os.Getenv("RABBIT_HOST"), os.Getenv("RABBIT_PORT"))
 		fmt.Printf("Connecting to AMPQ at %s\n", rabbitURL)
 
 		conn, err := amqp.Dial(rabbitURL)
@@ -463,9 +463,16 @@ func main() {
 
 		// now find contours
 		contours := gocv.FindContours(imgThresh, gocv.RetrievalExternal, gocv.ChainApproxSimple)
-		contours = filter.Choose(contours, isTrackable).([][]image.Point)
-		contours = filter.Choose(contours, bm.isInsideMask).([][]image.Point)
-		bb := getBoundingBoxes(contours)
+		newContours := [][]image.Point{}
+		for _, c := range contours.ToPoints() {
+			if isTrackable(c) && bm.isInsideMask(c) {
+				newContours = append(newContours, c)
+			}
+		}
+
+		// newContours := filter.Choose(contours.ToPoints(), isTrackable).([][]image.Point)
+		// newContours = filter.Choose(contours, bm.isInsideMask).([][]image.Point)
+		bb := getBoundingBoxes(newContours)
 
 		tracker.Update(bb)
 
@@ -473,7 +480,7 @@ func main() {
 
 			cars[id] = &Car{
 				Track:   []CarTrack{},
-				Tracker: contrib.NewTrackerMOSSE(),
+				Tracker: contrib.NewTrackerCSRT(),
 			}
 
 			defer cars[id].Tracker.Close()

@@ -1,0 +1,10 @@
+export RABBIT_USER="cartracker"
+export RABBIT_PASS="F93fRZ05mt2rdwlF"
+export RABBIT_PORT="30925"
+export RABBIT_HOST="10.0.0.62"
+
+export S3_HOST="https://minio.high.am"
+export S3_KEY="ZEJU6E4VDMXUOB2SPDR6"
+export S3_SECRET="rpbPPqorL9w2NdKwhPiZU384mOP7nixgrOL7d59F"
+export STREAM_URL="rtsp://admin:BritishAmerican@192.168.1.17:554/cam/realmonitor?channel=1&subtype=1"
+export S3_BUCKET="speedcam"

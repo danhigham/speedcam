@@ -1,3 +1,4 @@
 {
-    "image": "harbor.high.am/library/speedcam"
+    "image": "harbor.high.am/library/speedcam",
+    "forwardPorts": [8080]
 }
